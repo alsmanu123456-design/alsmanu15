@@ -37,7 +37,11 @@ export async function speechToText(audioBuffer, opts = {}) {
     form.append('diarization', 'false');
     form.append('durationSec', '0');
 
-    const headers = { 'User-Agent': BROWSER_UA };
+    const headers = {
+      'User-Agent': BROWSER_UA,
+      'Referer': `${BASE_URL}/`,
+      'Origin': BASE_URL,
+    };
     let res = await fetch(`${BASE_URL}/api/speech-to-text`, { method: 'POST', headers, body: form });
     if (!res.ok && res.status >= 500) {
       await new Promise((r) => setTimeout(r, 1200));

@@ -45,10 +45,16 @@ export async function textToSpeech(text, opts = {}) {
   const rate = opts.rate || '+0%';
   const pitch = opts.pitch || '+0Hz';
 
+  const COMMON_HEADERS = {
+    'User-Agent': BROWSER_UA,
+    'Referer': `${BASE_URL}/`,
+    'Origin': BASE_URL,
+  };
+
   try {
     const genRes = await fetch(`${BASE_URL}/api/tts`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA },
+      headers: { 'Content-Type': 'application/json', ...COMMON_HEADERS },
       body: JSON.stringify({ text: trimmed, voice, rate, pitch }),
     });
     if (!genRes.ok) {
@@ -59,7 +65,7 @@ export async function textToSpeech(text, opts = {}) {
     if (!fileId) return { ok: false, error: 'لم يصل file_id من الخدمة' };
 
     const audioRes = await fetch(`${BASE_URL}/api/audio/${encodeURIComponent(fileId)}`, {
-      headers: { 'User-Agent': BROWSER_UA },
+      headers: { ...COMMON_HEADERS },
     });
     if (!audioRes.ok) {
       return { ok: false, error: `فشل تنزيل الصوت (HTTP ${audioRes.status})` };

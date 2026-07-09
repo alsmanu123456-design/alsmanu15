@@ -23,7 +23,9 @@ export class Queue {
   #pending = [];
   #running = 0;
   #paused  = false;
-  #stats   = { processed: 0, failed: 0, retried: 0, timedOut: 0 };
+  // [ZOMBIE-FIX] عدّاد المهام الزومبي (تجاوزت timeout وما زالت تعمل بالخلفية)
+  #zombies = 0;
+  #stats   = { processed: 0, failed: 0, retried: 0, timedOut: 0, recovered: 0 };
 
   /**
    * @param {object} [options]
@@ -86,9 +88,26 @@ export class Queue {
     return cancelled.length;
   }
 
-  /** @returns {{ pending, running, processed, failed, retried, timedOut }} */
+  /** @returns {{ pending, running, zombies, processed, failed, retried, timedOut, recovered }} */
   getStats() {
-    return { pending: this.#pending.length, running: this.#running, ...this.#stats };
+    return { pending: this.#pending.length, running: this.#running, zombies: this.#zombies, ...this.#stats };
+  }
+
+  /**
+   * [ZOMBIE-FIX] إنعاش قسري — صمام أمان أخير.
+   * إذا اكتشف الـ watchdog أن القناة متجمدة (running ممتلئ بلا أي تقدم)
+   * يُصفّر العدّاد ويعيد تشغيل الطابور. المهام المتجمدة تُترك كزومبي.
+   * @returns {number} عدد الخانات المحررة
+   */
+  forceRecover() {
+    const stuck = this.#running;
+    if (stuck > 0) {
+      this.#zombies += stuck;
+      this.#running = 0;
+      this.#stats.recovered += stuck;
+      this.#tick();
+    }
+    return stuck;
   }
 
   /** عدد المهام المعلّقة حالياً. */
@@ -142,17 +161,25 @@ export class Queue {
       const isTimeout = e?._queueTimeout === true;
 
       if (isTimeout) {
-        // ── Timeout: أرفض الـ caller فوراً لكن أنتظر المهمة الفعلية
+        // ── [ZOMBIE-FIX] Timeout: حرّر الـ slot فوراً — لا تنتظر المهمة المعلّقة
+        //
+        // الكود السابق كان يعمل `await fnPromise` قبل تحرير الـ slot.
+        // إذا كانت fnPromise معلّقة للأبد (سوكت ميت، تنزيل متجمد، شبكة مقطوعة)
+        // فالـ slot لا يتحرر أبداً. مع maxConcurrent=3 في قناة الأوامر،
+        // ثلاث مهام معلّقة = موت كامل ودائم لأوامر "رسالي" حتى إعادة التشغيل.
+        //
+        // الحل: نحرر الـ slot فوراً ونتتبع المهمة كـ "زومبي" في عدّاد منفصل.
+        // عندما تنتهي فعلاً (إن انتهت) ينقص العدّاد. القناة لا تموت أبداً.
         this.#stats.timedOut++;
         item.reject(e);
-
-        // ⚠️ لا نُفرج عن الـ slot حتى تنتهي fnPromise فعلياً
-        // هذا يضمن أن #running لا يتجاوز maxConcurrent
-        try { await fnPromise; } catch {}
-        // fnPromise انتهت (ناجحة أو فاشلة) → نُفرج الـ slot الآن
+        this.#zombies++;
+        fnPromise.then(
+          () => { this.#zombies--; },
+          () => { this.#zombies--; }
+        );
         this.#running--;
         this.#tick();
-        return; // نرجع مباشرةً — لا نصل finally
+        return;
 
       } else if (item.attempts <= this.maxRetries) {
         // ── إعادة محاولة ────────────────────────────────────────

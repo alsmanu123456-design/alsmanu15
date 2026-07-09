@@ -49,6 +49,80 @@ function _uStat(userId) {
 let _dropCounter = 0;
 const DROP_LOG_SAMPLE = 10; // سجّل واحدة من كل 10
 
+// ══════════════════════════════════════════════════════════════════
+// [IMMORTAL-COMMANDS] المسار السريع لأوامر "رسالي"
+// ──────────────────────────────────────────────────────────────────
+// أوامر المستخدم (fromMe) لا تدخل أي طابور مشترك إطلاقاً.
+// تُنفَّذ مباشرة وفوراً — مهما كان عدد المستخدمين ومهما تراكمت
+// رسائل الآخرين، أمرك ينفَّذ لحظة كتابته.
+//
+// حماية: سقف 8 أوامر متزامنة لكل مستخدم (يستحيل تجاوزه بالكتابة اليدوية)
+// وعند التجاوز يتحول الفائض للطابور القديم بدل الإسقاط.
+// ══════════════════════════════════════════════════════════════════
+const CMD_INFLIGHT_MAX = 8;
+/** @type {Map<string, number>} */
+const _cmdInflight = new Map();
+
+function _execCommandDirect(sock, userId, msg, applyForward, mainHandler) {
+  const cur = _cmdInflight.get(userId) || 0;
+  if (cur >= CMD_INFLIGHT_MAX) {
+    // فيضان غير طبيعي — الفائض يذهب للطابور القديم (لا يُفقد)
+    LANE_COMMAND.push(
+      `cmd:${userId}:${msg.key?.remoteJid || ""}`,
+      () => _processMsg(sock, userId, msg, applyForward, mainHandler),
+      10
+    ).catch(() => {});
+    return;
+  }
+  _cmdInflight.set(userId, cur + 1);
+  const done = () => {
+    const n = (_cmdInflight.get(userId) || 1) - 1;
+    if (n <= 0) _cmdInflight.delete(userId);
+    else _cmdInflight.set(userId, n);
+  };
+  // تنفيذ مباشر — العدّاد يُحرَّر عند الانتهاء أو بعد 90 ثانية كحد أقصى
+  let released = false;
+  const releaseOnce = () => { if (!released) { released = true; done(); } };
+  const guard = setTimeout(releaseOnce, 90_000);
+  if (typeof guard.unref === "function") guard.unref();
+  _processMsg(sock, userId, msg, applyForward, mainHandler)
+    .then(() => { clearTimeout(guard); releaseOnce(); })
+    .catch(() => { clearTimeout(guard); releaseOnce(); });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// [WATCHDOG] كلب الحراسة — إنعاش ذاتي كل 60 ثانية
+// ──────────────────────────────────────────────────────────────────
+// يراقب القنوات: إذا كانت قناة ممتلئة (running == max) مع مهام منتظرة
+// وبدون أي تقدم لـ 3 فحوصات متتالية (3 دقائق) → إنعاش قسري فوري.
+// البوت يعالج نفسه بنفسه — لا حاجة للتنظيف اليدوي أبداً.
+// ══════════════════════════════════════════════════════════════════
+const _wdState = new Map(); // laneName -> { lastProcessed, stalls }
+let _wdRecoveries = 0;
+
+function _watchdogCheck() {
+  const lanes = [
+    ["command",    LANE_COMMAND,    3],
+    ["notify",     LANE_NOTIFY,     5],
+    ["newsletter", LANE_NEWSLETTER, 2],
+  ];
+  for (const [name, lane, maxC] of lanes) {
+    const s = lane.getStats();
+    const prev = _wdState.get(name) || { lastProcessed: s.processed, stalls: 0 };
+    const frozen = s.running >= maxC && s.pending > 0 && s.processed === prev.lastProcessed;
+    const stalls = frozen ? prev.stalls + 1 : 0;
+    _wdState.set(name, { lastProcessed: s.processed, stalls });
+    if (stalls >= 3) {
+      const freed = lane.forceRecover();
+      _wdRecoveries += freed;
+      _wdState.set(name, { lastProcessed: s.processed, stalls: 0 });
+      process.stderr.write(`[WATCHDOG] قناة ${name} كانت متجمدة — تم إنعاش ${freed} خانة تلقائياً (إجمالي الإنعاشات: ${_wdRecoveries})\n`);
+    }
+  }
+}
+const _wdTimer = setInterval(_watchdogCheck, 60_000);
+if (typeof _wdTimer.unref === "function") _wdTimer.unref();
+
 // ── الـ API العام ─────────────────────────────────────────────────
 
 /**
@@ -87,6 +161,7 @@ export function teardown(userId) {
   n += LANE_NOTIFY.clearByLabel(`ntf:${userId}:`);
   n += LANE_NEWSLETTER.clearByLabel(`nl:${userId}:`);
   _userStats.delete(userId);
+  _cmdInflight.delete(userId); // [IMMORTAL-COMMANDS] تصفير عدّاد الأوامر المباشرة
   return n;
 }
 
@@ -98,14 +173,11 @@ function _routeMessage(sock, userId, msg, type, isNewsletter, applyForward, main
 
   const us = _uStat(userId);
 
-  // أوامر المستخدم — أعلى أولوية
+  // أوامر المستخدم — [IMMORTAL-COMMANDS] تنفيذ مباشر خارج أي طابور
+  // لا يمكن لأي تراكم رسائل أو مستخدمين آخرين أن يمنع أمرك من التنفيذ
   if (type === "notify" && msg.key?.fromMe) {
     _stats.commands++; us.commands++;
-    LANE_COMMAND.push(
-      `cmd:${userId}:${jid}`,
-      () => _processMsg(sock, userId, msg, applyForward, mainHandler),
-      10
-    ).catch(() => {});
+    _execCommandDirect(sock, userId, msg, applyForward, mainHandler);
     return;
   }
 
@@ -157,6 +229,8 @@ async function _processMsg(sock, userId, msg, applyForward, mainHandler) {
 export function getPipelineStats() {
   return {
     ..._stats,
+    watchdogRecoveries: _wdRecoveries,
+    commandsInflight: [..._cmdInflight.values()].reduce((a, b) => a + b, 0),
     lanes: {
       command:    LANE_COMMAND.getStats(),
       notify:     LANE_NOTIFY.getStats(),

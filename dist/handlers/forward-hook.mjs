@@ -10,6 +10,14 @@
 export function register(dispatcherMod) {
   dispatcherMod.registerPrefix('fw_', async (_data, _bot, _query) => {
     const { handleForwardCallback: _hfc } = await import('../forward.mjs');
-    await _hfc(_query).catch(() => false);
+    // [FIX-LIST-NAV] لا نكتم الأخطاء بصمت — نسجلها ونخبر المستخدم بدل زر ميت
+    try {
+      await _hfc(_query);
+    } catch (e) {
+      console.error('[FW-HOOK] handleForwardCallback error:', e?.message || e);
+      try {
+        await _bot.answerCallbackQuery(_query.id, { text: '⚠️ حدث خطأ مؤقت — أعد المحاولة' }).catch(() => {});
+      } catch {}
+    }
   });
 }

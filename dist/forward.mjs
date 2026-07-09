@@ -41,6 +41,13 @@ export function registerForwardSock(phoneNumber, sock) {
   if (!phoneNumber || !sock) return;
   _socksByNumber.set(phoneNumber, sock);
 }
+// [MULTI-NUM] إزالة سوكت رقم مفصول حتى لا يظهر كخيار ميت في قوائم التحويل
+export function unregisterForwardSock(phoneNumber) {
+  if (!phoneNumber) return;
+  const s = _socksByNumber.get(phoneNumber);
+  _socksByNumber.delete(phoneNumber);
+  if (s && s === _sock) _sock = _socksByNumber.size ? _socksByNumber.values().next().value : null;
+}
 export function getConnectedForwardNumbers() {
   return Array.from(_socksByNumber.keys());
 }
@@ -460,7 +467,8 @@ function rulesListKb(rules, page = 0) {
   // [FIX-04] استخدام PAGE الموحّد بدلاً من P=8 المحلي
   const slice = rules.slice(page * PAGE, (page + 1) * PAGE);
   const rows = slice.map((r) => [{
-    text: (r.enabled ? "🟢 " : "🔴 ") + r.name.slice(0, 40),
+    // [FIX-GRL-NAV] اسم افتراضي إن غاب حتى لا تنهار القائمة كلها
+    text: (r.enabled ? "🟢 " : "🔴 ") + String(r?.name || r?.id || "قاعدة").slice(0, 40),
     callback_data: "fw_rl_" + r.id,
   }]);
   const nav = [];
@@ -473,20 +481,24 @@ function rulesListKb(rules, page = 0) {
 
 // قائمة مجموعات أو قنوات مع pagination وبحث
 function chatListKb(items, page, prefix, selected = [], multi = true, backCb = "fw_menu") {
+  // [FIX-LIST-NAV] تثبيت الصفحة داخل الحدود + اسم افتراضي إن غاب
+  // (كان item.name.slice يرمي TypeError لعنصر بلا اسم فيقتل زر التالية بصمت)
+  const total = Math.max(1, Math.ceil(items.length / PAGE));
+  page = Math.min(Math.max(0, page), total - 1);
   const start = page * PAGE;
   const pageItems = items.slice(start, start + PAGE);
-  const total = Math.ceil(items.length / PAGE);
 
   const rows = pageItems.map((item, i) => {
     const idx = start + i;
-    const isSel = selected.includes(item.id);
-    return [{ text: (isSel ? "✅ " : "⬜ ") + item.name.slice(0, 38), callback_data: prefix + "t" + idx }];
+    const isSel = selected.includes(item?.id);
+    const label = String(item?.name || item?.subject || item?.id || "بدون اسم").slice(0, 38);
+    return [{ text: (isSel ? "✅ " : "⬜ ") + label, callback_data: prefix + "t" + idx }];
   });
 
   // Pagination
   const nav = [];
   if (page > 0) nav.push({ text: "◀️ السابقة", callback_data: prefix + "p" + (page - 1) });
-  nav.push({ text: `📄 ${page + 1}/${total || 1}`, callback_data: "noop" });
+  nav.push({ text: `📄 ${page + 1}/${total}`, callback_data: "noop" });
   if (page < total - 1) nav.push({ text: "التالية ▶️", callback_data: prefix + "p" + (page + 1) });
   rows.push(nav);
 
@@ -592,7 +604,7 @@ export async function handleForwardCallback(query) {
   }
 
   // ── إدارة القنوات ─────────────────────────────────────────────
-  if (data === "fw_chm") { ans(); await edit("📺 *إدارة القنوات والمجموعات*", chMgrKb()); return true; }
+  if (data === "fw_chm") { ans(); await edit("��� *إدارة القنوات والمجموعات*", chMgrKb()); return true; }
 
   if (data === "fw_ch_add") {
     ans();
@@ -753,13 +765,15 @@ export async function handleForwardCallback(query) {
       await edit("👥 *المجموعات المحفوظة*\n\nلا توجد مجموعات بعد.\nاضغط 🔄 تحديث لجلبها من واتساب.", chMgrKb());
       return true;
     }
-    const total = Math.ceil(items.length / PAGE);
-    const slice = items.slice(p * PAGE, (p + 1) * PAGE);
-    const rows = slice.map((g) => [{ text: g.name.slice(0, 40), callback_data: "noop" }]);
+    const total = Math.max(1, Math.ceil(items.length / PAGE));
+    // [FIX-GRL-NAV] ثبّت الصفحة داخل الحدود + اسم افتراضي إن غاب (كان g.name.slice يرمي خطأ يقتل زر التالي)
+    const pSafe = Math.min(Math.max(0, p), total - 1);
+    const slice = items.slice(pSafe * PAGE, (pSafe + 1) * PAGE);
+    const rows = slice.map((g) => [{ text: String(g?.name || g?.subject || g?.id || "مجموعة بدون اسم").slice(0, 40), callback_data: "noop" }]);
     const nav = [];
-    if (p > 0) nav.push({ text: "◀️ السابق", callback_data: "fw_grl_p" + (p - 1) });
-    nav.push({ text: `📄 ${p + 1}/${total}`, callback_data: "noop" });
-    if (p < total - 1) nav.push({ text: "التالي ▶️", callback_data: "fw_grl_p" + (p + 1) });
+    if (pSafe > 0) nav.push({ text: "◀️ السابق", callback_data: "fw_grl_p" + (pSafe - 1) });
+    nav.push({ text: `📄 ${pSafe + 1}/${total}`, callback_data: "noop" });
+    if (pSafe < total - 1) nav.push({ text: "التالي ▶️", callback_data: "fw_grl_p" + (pSafe + 1) });
     rows.push(nav);
     rows.push(backHome("fw_chm"));
     await edit(`👥 *المجموعات المحفوظة* (${items.length})`, { inline_keyboard: rows });

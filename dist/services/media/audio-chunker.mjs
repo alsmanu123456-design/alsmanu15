@@ -14,6 +14,7 @@ import os from "os";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
+import { getFfmpegPath, getFfprobePath } from "./ffmpeg-path.mjs";
 
 const MAX_CHUNK_SECONDS = 280; // هامش أمان تحت حد الـ5 دقائق (300 ثانية)
 
@@ -21,9 +22,10 @@ function tmpFile(ext) {
   return path.join(os.tmpdir(), `achunk_${crypto.randomBytes(6).toString("hex")}.${ext}`);
 }
 
-function runFfmpeg(args) {
+async function runFfmpeg(args) {
+  const bin = await getFfmpegPath(); // يعمل على أي استضافة عبر ffmpeg-static
   return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", args);
+    const ff = spawn(bin, args);
     let stderr = "";
     ff.stderr.on("data", (d) => { stderr += d.toString(); });
     ff.on("error", reject);
@@ -34,9 +36,10 @@ function runFfmpeg(args) {
   });
 }
 
-function runFfprobe(args) {
+async function runFfprobe(args) {
+  const bin = await getFfprobePath(); // يعمل على أي استضافة عبر ffprobe-static
   return new Promise((resolve, reject) => {
-    const fp = spawn("ffprobe", args);
+    const fp = spawn(bin, args);
     let stdout = "";
     let stderr = "";
     fp.stdout.on("data", (d) => { stdout += d.toString(); });
@@ -133,7 +136,12 @@ export async function splitOggIntoChunks(oggBuffer, chunkSeconds = MAX_CHUNK_SEC
     const files = (await fs.readdir(outDir)).filter((f) => f.startsWith("chunk_")).sort();
     const chunks = [];
     for (const f of files) {
-      chunks.push(await fs.readFile(path.join(outDir, f)));
+      const buf = await fs.readFile(path.join(outDir, f));
+      // تجاهل أي مقطع ذيلي شبه فارغ (أقل من ثانية) ينتج أحياناً عن حدود
+      // التقسيم — إرساله لخدمة التفريغ يسبب "فشل جزء" وهمياً بلا داعٍ.
+      const dur = await getDurationSeconds(buf, "ogg");
+      if (dur != null && dur < 1) continue;
+      chunks.push(buf);
     }
     if (chunks.length === 0) return { ok: false, error: "لم ينتج أي مقطع بعد التقسيم" };
     return { ok: true, chunks };
@@ -335,6 +343,33 @@ export function splitTextForTts(text, maxChars = 500) {
   flush();
   // ضمان أخير صارم: لا يخرج أي جزء أطول من maxChars مهما كانت الحالة
   return chunks.flatMap((c) => (c.length > maxChars ? hardSlice(c) : [c])).filter(Boolean);
+}
+
+/**
+ * ينفّذ دالة غير متزامنة على كل عنصر من مصفوفة بالتوازي، مع سقف للتزامن
+ * (concurrency) للحفاظ على السرعة دون تجاوز حدود الخدمة الخارجية.
+ * يُعيد النتائج بنفس ترتيب المدخلات (مهم لدمج مقاطع الصوت/النص بالترتيب).
+ * @template T, R
+ * @param {T[]} items
+ * @param {(item: T, index: number) => Promise<R>} worker
+ * @param {number} concurrency الحد الأقصى للطلبات المتزامنة (افتراضي 6)
+ * @returns {Promise<R[]>}
+ */
+export async function mapWithConcurrency(items, worker, concurrency = 6) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
+
+  async function runner() {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, () => runner()));
+  return results;
 }
 
 export { MAX_CHUNK_SECONDS };

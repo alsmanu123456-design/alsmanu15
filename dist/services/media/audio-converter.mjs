@@ -8,17 +8,19 @@ import os from "os";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
+import { getFfmpegPath } from "./ffmpeg-path.mjs";
 
 export async function convertToWhatsappOpus(inputBuffer) {
   const tmpDir = os.tmpdir();
   const id = crypto.randomBytes(6).toString("hex");
   const inPath = path.join(tmpDir, `tts_in_${id}.mp3`);
   const outPath = path.join(tmpDir, `tts_out_${id}.ogg`);
+  const ffmpegBin = await getFfmpegPath(); // يعمل على أي استضافة عبر ffmpeg-static
 
   await fs.writeFile(inPath, inputBuffer);
   try {
     await new Promise((resolve, reject) => {
-      const ff = spawn("ffmpeg", [
+      const ff = spawn(ffmpegBin, [
         "-y",
         "-i", inPath,
         "-c:a", "libopus",

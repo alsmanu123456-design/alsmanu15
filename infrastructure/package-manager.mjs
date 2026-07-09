@@ -22,6 +22,10 @@ const CRITICAL_PACKAGES = [
   "yt-search",
   "node-telegram-bot-api",
   "sharp",
+  // ثنائيات ffmpeg/ffprobe مرفقة كحزم npm — تضمن عمل ميزتَي تحويل
+  // النص↔الصوت (تقسيم/دمج المقاطع) على أي استضافة دون تثبيت يدوي.
+  "ffmpeg-static",
+  "ffprobe-static",
 ];
 
 // ── تثبيت node_modules إذا غائبة ────────────────────────────

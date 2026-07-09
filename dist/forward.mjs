@@ -170,7 +170,7 @@ async function _fetchAndShowNewsletter(uid, type, key, displayFn) {
     const verified = meta.verification === "VERIFIED" ? " ✅" : "";
     ss(uid, { chSearchResult: { id: meta.id, name, type, key } });
     await displayFn(
-      `📺 *${name}${verified}*\n\n👥 المشتركون: ${subs}${desc ? "\n\n📝 " + desc : ""}`,
+      `📺 *${name}${verified}*\n\n���� المشتركون: ${subs}${desc ? "\n\n📝 " + desc : ""}`,
       {
         inline_keyboard: [
           [{ text: "📥 اشتراك في القناة", callback_data: "fw_chfollow" }],
@@ -691,14 +691,25 @@ export async function handleForwardCallback(query) {
     return true;
   }
 
-  // ── تنزيل بروفايل القناة ─────────────────────────────────────
+  // ── تنزيل بروفايل القناة (كامل: صورة + اسم + وصف + مشتركين) ──
   if (data === "fw_chpic") {
-    ans("⏳ جاري تنزيل البروفايل...");
+    ans("⏳ جاري تنزيل البروفايل الكامل...");
     const result = gs(uid).chSearchResult;
     if (!result?.id) { await send("⚠️ لا توجد قناة في الجلسة"); return true; }
     if (!_sock) { await send("⚠️ واتساب غير متصل"); return true; }
+    // [CHPROFILE-FULL] 1) اجلب أحدث بيانات القناة (اسم/وصف/مشتركين/توثيق/تاريخ)
+    let _meta = null;
     try {
-      // [FIX-CHPIC-v2] نجرب "image" ثم "preview" ثم نرفع خطأ واضح
+      _meta = await _sock.newsletterMetadata(result.type === "invite" ? "invite" : "jid", result.key || result.id);
+    } catch {}
+    const _nm = (_meta?.name && String(_meta.name).trim()) || result.name || result.id;
+    const _dsc = _meta?.description ? String(_meta.description).slice(0, 600) : "";
+    const _sbs = _meta?.subscribers ? Number(_meta.subscribers).toLocaleString("ar-SA") : "—";
+    const _vrf = _meta?.verification === "VERIFIED" ? " ✅ موثّقة" : "";
+    const _crt = _meta?.creation_time ? new Date(Number(_meta.creation_time) * 1000).toLocaleDateString("ar") : "";
+    const _cap = `📺 *${_nm}*${_vrf}\n\n👥 المشتركون: ${_sbs}${_crt ? `\n📅 تاريخ الإنشاء: ${_crt}` : ""}\n🆔 \`${result.id}\`${_dsc ? `\n\n📝 *الوصف:*\n${_dsc}` : ""}`;
+    // 2) حاول تنزيل الصورة وإرسالها مع البيانات؛ وإلا أرسل البيانات نصاً
+    try {
       let url;
       try { url = await _sock.profilePictureUrl(result.id, "image"); }
       catch { url = await _sock.profilePictureUrl(result.id, "preview"); }
@@ -707,18 +718,18 @@ export async function handleForwardCallback(query) {
         signal: AbortSignal.timeout(15000),
       });
       if (!_picRes.ok) throw new Error("HTTP " + _picRes.status);
-      // [FIX-CHPIC-v2] إرسال Buffer مباشرة بدل Stream لتفادي مشكلة node-telegram-bot-api
       const _picBuf = Buffer.from(await _picRes.arrayBuffer());
       if (!_picBuf.length) throw new Error("empty buffer");
       await _bot.sendPhoto(
         chatId,
         _picBuf,
-        { caption: `🖼️ بروفايل: ${result.name || result.id}` },
+        { caption: _cap, parse_mode: "Markdown" },
         { filename: "profile.jpg", contentType: "image/jpeg" }
       );
     } catch (e) {
-      console.error("[FW] fw_chpic error:", e?.message || String(e));
-      await send("❌ *تعذّر تنزيل البروفايل*\n\nالأسباب المحتملة:\n• القناة/المجموعة لا تملك صورة\n• صلاحيات الخصوصية\n\nتفصيل: `" + (e?.message || 'unknown') + "`");
+      console.error("[FW] fw_chpic pic error:", e?.message || String(e));
+      // لا صورة؟ أرسل البروفايل النصي الكامل بدلاً من رسالة فشل جافة
+      await send(_cap + "\n\n⚠️ _القناة لا تملك صورة بروفايل قابلة للتنزيل._");
     }
     return true;
   }

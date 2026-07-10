@@ -1,12 +1,21 @@
 #!/usr/bin/env node
 /**
- * stream-dl.mjs — Zero-Disk Streaming Downloader v2.0
+ * stream-dl.mjs — Pure-Streaming Downloader v3.0
  *
- * ما يميز هذا الإصدار:
- *  • جودات صحيحة: 1=360p | 2=720p | 3=أفضل جودة متاحة
- *  • لا حد للحجم — الأفلام حتى 3GB+ بصفر RAM على السيرفر
- *  • استراتيجية ثلاثية: URL مباشر → بث yt-dlp → بافر كمخرج أخير
- *  • عدد صحيح: /vid 5 = 5 فيديوهات مختلفة (offset)
+ * المعمارية: صفر تنزيل على السيرفر — البيانات تتدفق مباشرة من CDN يوتيوب
+ * إلى واتساب عبر أحد مسارين فقط:
+ *
+ *   المسار A (الأفضل): رابط مباشر واحد → Baileys يبثه بنفسه { url }
+ *   المسار B: دمج/تحويل ffmpeg بالنسخ (بدون إعادة ترميز) → أنبوب مباشر { stream }
+ *
+ * لا يوجد أي مسار Buffer — لا RAM ولا ملفات مؤقتة من طرفنا.
+ * (واتساب نفسه يتطلب تمريرة تشفير واحدة عابرة يديرها Baileys داخلياً)
+ *
+ * إصلاحات v3:
+ *  • فيديو صامت في الجودة العالية (كان يُرسل رابط الفيديو بدون الصوت) — أُصلح
+ *  • 720p حقيقية عبر دمج DASH بالنسخ (يوتيوب أزال الصيغة المدمجة 22)
+ *  • صيغ واتساب الأصيلة: mp4 (h264+aac) للفيديو، m4a/aac للصوت
+ *  • تمرير المدة والصورة المصغرة لتجنب حفظ Baileys نسخة أصلية ثانية على القرص
  */
 
 import { spawn, execFile } from "child_process";
@@ -16,63 +25,19 @@ import { fileURLToPath }    from "url";
 import { promisify }        from "util";
 import https from "https";
 import http  from "http";
+import { PassThrough } from "stream";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const execFileP = promisify(execFile);
 
-// ── جودات yt-dlp الصحيحة ────────────────────────────────────────────────────
-// نفضّل الصيغ pre-merged (video+audio في ملف واحد) لأنها لا تحتاج ffmpeg
-// 18  = 360p  H.264+AAC mp4 — متوفر دائماً
-// 22  = 720p  H.264+AAC mp4 — متوفر في معظم الفيديوهات
-// 137+140 = 1080p video + AAC audio → يحتاج ffmpeg merge
-
-const FORMATS = {
-  // ── فيديو / فيلم ──────────────────────────────────────────────────────────
-  vid: {
-    1: "18",                                    // 360p pre-merged — مضمون 100%
-    2: "22/18",                                 // 720p ← هذا الصحيح لـ "متوسط"
-    3: "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/22/18"  // أفضل جودة
-  },
-  film: {
-    1: "18",
-    2: "22/18",
-    3: "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/22/18"
-  },
-  // ── صوت ─────────────────────────────────────────────────────────────────
-  // 140 = m4a/aac 128kbps — متوفر على 99%+ من يوتيوب (أفضل لواتساب)
-  // 139 = m4a/aac 48kbps — احتياطي
-  // نتجنب 251/250 (opus/webm) لأن واتساب لا يدعمها كملف صوتي عادي
-  song: "140/139/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio"
-};
-
-// ── كشف صيغة الصوت من بايتات البافر ────────────────────────────────────────
-function detectAudioExt(buf) {
-  if (!buf || buf.length < 12) return "m4a";
-  // OGG / Opus
-  if (buf[0] === 0x4F && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) return "ogg";
-  // WebM (EBML header)
-  if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return "ogg";
-  // MP3 — ID3 tag
-  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return "mp3";
-  // MP3 — sync frame (0xFFEx or 0xFFFx)
-  if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return "mp3";
-  // MP4/M4A — ftyp box at byte offset 4
-  if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return "m4a";
-  return "m4a";
-}
-
 const QUALITY_LABEL = {
   1: "منخفضة 360p",
   2: "متوسطة 720p",
-  3: "عالية (أفضل)"
+  3: "عالية 1080p"
 };
 
-// لا حد قصوى للحجم — النظام يختار الأسلوب المناسب تلقائياً
-// RAM Buffer يُستخدم فقط كمسار أخير
-const BUFFER_MAX_MB = 800; // حد البافر: 800MB كمسار أخير فقط
-
 // ══════════════════════════════════════════════════════════════════════════════
-// مساعدات مرئية
+// مساعدات مرئية (واجهة متوافقة مع الإصدارات السابقة)
 // ══════════════════════════════════════════════════════════════════════════════
 
 export function fmtBytes(b) {
@@ -85,7 +50,7 @@ export function fmtBytes(b) {
 export function progressBar(pct, width = 14) {
   if (pct < 0) {
     const spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    return spin[Math.floor(Date.now() / 300) % spin.length] + " جاري الاستقبال...";
+    return spin[Math.floor(Date.now() / 300) % spin.length] + " جاري البث...";
   }
   const p = Math.max(0, Math.min(100, pct));
   const filled = Math.round(p / 100 * width);
@@ -95,38 +60,41 @@ export function progressBar(pct, width = 14) {
 export function buildProgressMsg(title, stage, qlLabel, recv, total, pct) {
   const bar = progressBar(typeof pct === "number" ? pct : -1);
   const sep = "━".repeat(22);
-  let lines = ["🎬 *" + title.slice(0, 50) + "*", sep];
+  let lines = ["🎬 *" + String(title || "").slice(0, 50) + "*", sep];
 
   switch (stage) {
     case "search":
-      lines.push("🔍 البحث على يوتيوب...", "⚡ صفر ملفات على السيرفر");
+      lines.push("🔍 البحث على يوتيوب...", "⚡ بث مباشر — صفر تخزين");
       break;
     case "found":
-      lines.push("✅ تم العثور — جودة " + qlLabel, "📡 جاري الحصول على رابط البث...", "⚡ صفر ملفات على السيرفر");
+      lines.push("✅ تم العثور — جودة " + qlLabel, "📡 جاري تجهيز رابط البث...", "⚡ بث مباشر — صفر تخزين");
       break;
     case "url_send":
-      lines.push("📡 إرسال مباشر — " + qlLabel, "واتساب يحمّل مباشرةً بدون RAM", "⚡ صفر موارد على السيرفر");
+      lines.push("📡 بث مباشر من المصدر → واتساب", "جودة " + qlLabel, "⚡ صفر تنزيل على السيرفر");
+      break;
+    case "merging":
+      lines.push("🔗 دمج الصوت والصورة أثناء البث — " + qlLabel, bar, "💨 " + fmtBytes(recv) + " تدفّقت | صفر تخزين");
       break;
     case "streaming":
     case "piping":
-      lines.push("📥 بث مباشر — " + qlLabel, bar, "💾 " + fmtBytes(recv) + " | ⚡ صفر ملفات");
+      lines.push("📡 بث مباشر — " + qlLabel, bar, "💨 " + fmtBytes(recv) + " تدفّقت | صفر تخزين");
       break;
     case "progress":
       const recvStr = fmtBytes(recv);
       const totStr  = total > 0 ? " / " + fmtBytes(total) : "";
-      lines.push("📥 استلام — " + qlLabel, bar, "💾 " + recvStr + totStr + " | ⚡ صفر ملفات");
+      lines.push("📡 تدفق — " + qlLabel, bar, "💨 " + recvStr + totStr + " | صفر تخزين");
       break;
     case "done":
-      lines.push("✅ اكتمل — " + fmtBytes(recv), "📤 جاري الإرسال لواتساب...");
+      lines.push("✅ اكتمل البث — " + fmtBytes(recv), "📤 واتساب يعالج الوسائط...");
       break;
     default:
-      lines.push(stage);
+      lines.push(String(stage));
   }
   return lines.join("\n");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// مسار yt-dlp
+// مسارات الأدوات (yt-dlp + ffmpeg)
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function ytdlpBin() {
@@ -141,30 +109,42 @@ async function ytdlpBin() {
   throw new Error("yt-dlp غير موجود");
 }
 
-// الحصول على مسار ffmpeg
-function ffmpegPath() {
-  if (process.env.FFMPEG_PATH && existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
-  const nix = "/nix/store/k28ypnisbhajg3x1kv5hy7h2vjbajkvy-replit-runtime-path/bin/ffmpeg";
-  if (existsSync(nix)) return nix;
-  return "ffmpeg";
+let _ffmpegCached = null;
+async function ffmpegBin() {
+  if (_ffmpegCached) return _ffmpegCached;
+  // 1) الحلّال الموحد (نظام أولاً ثم ffmpeg-static)
+  try {
+    const mod = await import(join(__dirname, "dist", "services", "media", "ffmpeg-path.mjs"));
+    if (mod.getFfmpegPath) {
+      _ffmpegCached = await mod.getFfmpegPath();
+      return _ffmpegCached;
+    }
+  } catch {}
+  // 2) متغير البيئة
+  if (process.env.FFMPEG_PATH && existsSync(process.env.FFMPEG_PATH)) {
+    _ffmpegCached = process.env.FFMPEG_PATH;
+    return _ffmpegCached;
+  }
+  // 3) ffmpeg-static مباشرة
+  try {
+    const { createRequire } = await import("module");
+    const req = createRequire(join(__dirname, "package.json"));
+    const p = req("ffmpeg-static");
+    if (p && existsSync(p)) { _ffmpegCached = p; return p; }
+  } catch {}
+  _ffmpegCached = "ffmpeg";
+  return _ffmpegCached;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// البحث على يوتيوب مع دعم Offset (للحصول على نتائج مختلفة)
+// البحث على يوتيوب مع دعم Offset
 // ══════════════════════════════════════════════════════════════════════════════
 
-/**
- * @param {string[]} queries   — قائمة نصوص البحث
- * @param {number}   minDurSec — حد أدنى للمدة (ثانية)
- * @param {number}   offset    — رقم النتيجة المطلوبة (0=الأولى, 1=الثانية...)
- * @param {number}   poolSize  — عدد النتائج للجلب (للاختيار من بينها)
- */
 export async function youtubeSearch(queries, minDurSec, offset, poolSize) {
   minDurSec = minDurSec || 0;
   offset    = Math.max(0, parseInt(offset) || 0);
   poolSize  = Math.max(offset + 1, parseInt(poolSize) || offset + 5);
 
-  // المحاولة 1: yt-search (npm)
   let ytSearch = null;
   try { ytSearch = (await import(join(__dirname, "node_modules", "yt-search", "index.js"))).default; } catch {}
   if (!ytSearch) { try { ytSearch = (await import("yt-search")).default; } catch {} }
@@ -180,25 +160,24 @@ export async function youtubeSearch(queries, minDurSec, offset, poolSize) {
           .filter(v => !minDurSec || ((v.duration && v.duration.seconds) || 0) >= minDurSec);
         if (vids.length > offset) {
           const v = vids[offset];
-          return { url: v.url, title: v.title || q, duration: (v.duration && v.duration.seconds) || 0 };
+          return { url: v.url, title: v.title || q, duration: (v.duration && v.duration.seconds) || 0, videoId: v.videoId || null };
         }
         if (vids.length > 0) {
-          // offset أكبر من النتائج — خذ الأخير
           const v = vids[vids.length - 1];
-          return { url: v.url, title: v.title || q, duration: (v.duration && v.duration.seconds) || 0 };
+          return { url: v.url, title: v.title || q, duration: (v.duration && v.duration.seconds) || 0, videoId: v.videoId || null };
         }
       } catch {}
     }
   }
 
-  // المحاولة 2: yt-dlp ytsearch
+  // احتياط: yt-dlp ytsearch
   const bin = await ytdlpBin();
   for (const q of queries) {
     try {
       const n = Math.max(5, poolSize);
       const { stdout } = await execFileP(bin, [
         "ytsearch" + n + ":" + q, "--flat-playlist",
-        "--print", "%(webpage_url)s\t%(title)s\t%(duration)s",
+        "--print", "%(webpage_url)s\t%(title)s\t%(duration)s\t%(id)s",
         "--no-warnings", "-q"
       ], { timeout: 20000 });
 
@@ -209,8 +188,9 @@ export async function youtubeSearch(queries, minDurSec, offset, poolSize) {
         const url   = parts[0];
         const title = parts[1] || q;
         const dur   = parseInt(parts[2] || "0");
+        const vid   = parts[3] || null;
         if (url && url.startsWith("http") && (!minDurSec || dur >= minDurSec))
-          all.push({ url, title, duration: dur });
+          all.push({ url, title, duration: dur, videoId: vid });
       }
       if (all.length > 0) {
         const idx = Math.min(offset, all.length - 1);
@@ -222,18 +202,14 @@ export async function youtubeSearch(queries, minDurSec, offset, poolSize) {
   return null;
 }
 
-/**
- * يبحث عن عدة نتائج دفعة واحدة
- */
 export async function youtubeSearchMultiple(query, count, minDurSec) {
   count     = Math.max(1, parseInt(count) || 1);
   minDurSec = minDurSec || 0;
 
   const bin = await ytdlpBin();
-  const n   = count * 2; // جلب ضعف العدد لتجنب النتائج السيئة
+  const n   = count * 2;
   const results = [];
 
-  // حاول yt-search أولاً
   let ytSearch = null;
   try { ytSearch = (await import(join(__dirname, "node_modules", "yt-search", "index.js"))).default; } catch {}
   if (!ytSearch) { try { ytSearch = (await import("yt-search")).default; } catch {} }
@@ -256,7 +232,6 @@ export async function youtubeSearchMultiple(query, count, minDurSec) {
 
   if (results.length >= count) return results.slice(0, count);
 
-  // yt-dlp ytsearch
   try {
     const { stdout } = await execFileP(bin, [
       "ytsearch" + n + ":" + query, "--flat-playlist",
@@ -282,167 +257,274 @@ export async function youtubeSearchMultiple(query, count, minDurSec) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// الحصول على رابط مباشر من YouTube CDN (بدون أي تحميل)
+// استخراج الروابط المباشرة من CDN يوتيوب (بدون أي تنزيل)
 // ══════════════════════════════════════════════════════════════════════════════
 
-export async function getDirectUrl(ytUrl, format) {
+/** يُرجع كل الروابط التي يطبعها yt-dlp (1 = مدمج، 2 = فيديو + صوت منفصلان) */
+export async function getDirectUrls(ytUrl, format) {
   const bin  = await ytdlpBin();
   const args = [ytUrl, "-f", format, "--get-url", "--no-playlist", "--no-warnings", "-q"];
-  const fm   = ffmpegPath();
-  if (fm) args.push("--ffmpeg-location", fm);
-
-  const { stdout } = await execFileP(bin, args, { timeout: 30000 });
+  const { stdout } = await execFileP(bin, args, { timeout: 40000 });
   const urls = stdout.trim().split("\n").filter(u => u.startsWith("http"));
   if (!urls.length) throw new Error("لم يُعثر على رابط مباشر");
-  // إذا كان هناك رابطان (video+audio منفصلين)، أول رابط هو الفيديو
+  return urls;
+}
+
+/**
+ * [توافقية] يُرجع رابطاً واحداً فقط إذا كانت الصيغة مدمجة (فيديو+صوت معاً)
+ * — يرمي خطأ لو كانت النتيجة رابطين، لمنع خطأ "الفيديو الصامت" القديم.
+ */
+export async function getDirectUrl(ytUrl, format) {
+  const urls = await getDirectUrls(ytUrl, format);
+  if (urls.length > 1) throw new Error("الصيغة تتطلب دمجاً (رابطان منفصلان)");
   return urls[0];
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// yt-dlp stdout pipe → Buffer (مسار أخير — بافر في RAM)
+// الصورة المصغرة من CDN يوتيوب (بضعة KB — تمنع Baileys من حفظ نسخة أصلية للقرص)
 // ══════════════════════════════════════════════════════════════════════════════
 
-export function ytdlpPipeToBuffer(ytUrl, format, maxMB, onChunk) {
-  return new Promise(async (resolve, reject) => {
-    const bin      = await ytdlpBin().catch(reject);
-    if (!bin) return;
-    const maxBytes = (maxMB || BUFFER_MAX_MB) * 1024 * 1024;
-    const fm       = ffmpegPath();
-    const args     = [ytUrl, "-f", format,
-      "--output", "-",
-      "--no-playlist", "--no-warnings", "-q", "--no-part",
-      "--ffmpeg-location", fm
-    ];
-
-    const proc   = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const chunks = [];
-    let received   = 0;
-    let lastReport = 0;
-    let dead       = false;
-
-    proc.stdout.on("data", chunk => {
-      if (dead) return;
-      received += chunk.length;
-      chunks.push(chunk);
-      if (maxMB && received > maxBytes) {
-        dead = true;
-        proc.kill("SIGKILL");
-        reject(new Error("حجم الملف تجاوز " + maxMB + "MB"));
-        return;
-      }
-      const now = Date.now();
-      if (onChunk && now - lastReport > 2500) {
-        lastReport = now;
-        onChunk(received, 0, -1).catch(() => {});
-      }
-    });
-
-    proc.stdout.on("end", () => {
-      if (dead) return;
-      dead = true;
-      if (received < 5000) return reject(new Error("البيانات فارغة أو صغيرة جداً"));
-      onChunk && onChunk(received, received, 100).catch(() => {});
-      resolve(Buffer.concat(chunks));
-    });
-
-    proc.on("error", e => { if (!dead) { dead = true; reject(e); } });
-    proc.on("close", code => {
-      if (!dead && code !== 0) { dead = true; reject(new Error("yt-dlp كود " + code)); }
-    });
-  });
+function extractVideoId(ytUrl) {
+  const m = String(ytUrl || "").match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
+  return m ? m[1] : null;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// HTTP GET streaming → Buffer (للروابط المباشرة)
-// ══════════════════════════════════════════════════════════════════════════════
-
-export function streamUrlToBuffer(url, maxMB, onChunk) {
-  return new Promise((resolve, reject) => {
-    const maxBytes = (maxMB || BUFFER_MAX_MB) * 1024 * 1024;
-    const chunks   = [];
-    let received   = 0;
-    let total      = 0;
-    let lastReport = 0;
-    let dead       = false;
-
-    function doRequest(targetUrl, hops) {
-      if (hops > 8) return reject(new Error("إعادة توجيه أكثر من اللازم"));
-      const lib = targetUrl.startsWith("https") ? https : http;
-      const req = lib.get(targetUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122",
-          "Accept": "*/*", "Accept-Encoding": "identity", "Range": "bytes=0-"
-        },
-        timeout: 300000
-      }, res => {
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location)
-          return doRequest(res.headers.location, hops + 1);
-        if (res.statusCode !== 200 && res.statusCode !== 206)
-          return reject(new Error("HTTP " + res.statusCode));
-        total = parseInt(res.headers["content-length"] || "0");
-
-        res.on("data", chunk => {
-          if (dead) return;
-          received += chunk.length;
-          chunks.push(chunk);
-          if (maxMB && received > maxBytes) {
-            dead = true; req.destroy();
-            reject(new Error("حجم الملف تجاوز " + maxMB + "MB"));
-            return;
-          }
-          const now = Date.now();
-          if (onChunk && now - lastReport > 2500) {
-            lastReport = now;
-            const pct = total > 0 ? Math.min(99, Math.round(received / total * 100)) : -1;
-            onChunk(received, total, pct).catch(() => {});
-          }
+export function fetchThumb(ytUrlOrId) {
+  return new Promise((resolve) => {
+    const id = /^[\w-]{11}$/.test(String(ytUrlOrId)) ? ytUrlOrId : extractVideoId(ytUrlOrId);
+    if (!id) return resolve(null);
+    const tryUrl = (name, next) => {
+      const req = https.get(`https://i.ytimg.com/vi/${id}/${name}.jpg`, { timeout: 6000 }, (res) => {
+        if (res.statusCode !== 200) { res.resume(); return next ? next() : resolve(null); }
+        const chunks = [];
+        let size = 0;
+        res.on("data", (c) => {
+          size += c.length;
+          if (size > 300 * 1024) { req.destroy(); return resolve(null); }
+          chunks.push(c);
         });
-
-        res.on("end", () => {
-          if (dead) return;
-          if (received < 5000) return reject(new Error("الملف فارغ أو صغير جداً"));
-          onChunk && onChunk(received, total || received, 100).catch(() => {});
-          resolve(Buffer.concat(chunks));
-        });
-        res.on("error", e => { if (!dead) { dead = true; reject(e); } });
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+        res.on("error", () => (next ? next() : resolve(null)));
       });
-
-      req.on("error", e => { if (!dead) { dead = true; reject(e); } });
-      req.on("timeout", () => { if (!dead) { dead = true; req.destroy(); reject(new Error("انتهت مهلة الاتصال")); } });
-    }
-    doRequest(url, 0);
+      req.on("error", () => (next ? next() : resolve(null)));
+      req.on("timeout", () => { req.destroy(); next ? next() : resolve(null); });
+    };
+    tryUrl("mqdefault", () => tryUrl("default", null));
   });
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// تدفق بيانات URL مباشرة (Node.js Readable) — لإرسالها لواتساب بدون RAM
+// أنابيب البث الصافي (صفر RAM / صفر ملفات من طرفنا)
 // ══════════════════════════════════════════════════════════════════════════════
+
+const FF_NET_ARGS = [
+  "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+  "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122"
+];
+
+/** يلف تدفقاً بعدّاد بايتات لإظهار التقدم دون لمس البيانات */
+function withByteCounter(stream, onBytes) {
+  if (!onBytes) return stream;
+  const pt = new PassThrough();
+  let received = 0;
+  let lastReport = 0;
+  stream.on("data", (chunk) => {
+    received += chunk.length;
+    const now = Date.now();
+    if (now - lastReport > 2500) {
+      lastReport = now;
+      try { onBytes(received); } catch {}
+    }
+  });
+  stream.pipe(pt);
+  stream.on("error", (e) => pt.destroy(e));
+  return pt;
+}
 
 /**
- * إرجاع ReadableStream من yt-dlp stdout (صفر RAM — بث مباشر)
- * يُستخدم عندما يدعم الـ socket المُرسِل streaming
+ * دمج فيديو + صوت من رابطين مباشرين إلى MP4 مُجزّأ عبر أنبوب — نسخ بدون
+ * إعادة ترميز (-c copy): شبه صفر CPU وصفر تخزين. MP4 المجزأ (fMP4) هو
+ * h264+aac قياسي يفهمه واتساب.
  */
-export async function ytdlpReadable(ytUrl, format) {
+export async function mergeUrlsToStream(videoUrl, audioUrl, onBytes) {
+  const ff = await ffmpegBin();
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    ...FF_NET_ARGS, "-i", videoUrl,
+    ...FF_NET_ARGS, "-i", audioUrl,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c", "copy",
+    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+    "-f", "mp4", "pipe:1"
+  ];
+  const proc = spawn(ff, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let errBuf = "";
+  proc.stderr.on("data", (d) => { errBuf = (errBuf + d.toString()).slice(-500); });
+  const stream = withByteCounter(proc.stdout, onBytes);
+  const cleanup = () => { try { proc.kill("SIGKILL"); } catch {} };
+  proc.on("close", (code) => {
+    if (code !== 0 && code !== null) stream.destroy(new Error("ffmpeg merge كود " + code + ": " + errBuf.slice(-200)));
+  });
+  return { stream, cleanup };
+}
+
+/** إعادة تغليف رابط واحد إلى fMP4 عبر أنبوب (لصيغ mp4 غير القابلة للبث مباشرة) */
+export async function remuxUrlToStream(url, onBytes) {
+  const ff = await ffmpegBin();
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    ...FF_NET_ARGS, "-i", url,
+    "-c", "copy",
+    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+    "-f", "mp4", "pipe:1"
+  ];
+  const proc = spawn(ff, args, { stdio: ["ignore", "pipe", "pipe"] });
+  proc.stderr.on("data", () => {});
+  const stream = withByteCounter(proc.stdout, onBytes);
+  const cleanup = () => { try { proc.kill("SIGKILL"); } catch {} };
+  return { stream, cleanup };
+}
+
+/**
+ * تحويل رابط صوت (أي codec) إلى AAC-ADTS عبر أنبوب — صيغة صوت أصيلة
+ * لواتساب قابلة للبث بلا حاويات تحتاج seek. تُستخدم فقط عندما لا يتوفر m4a.
+ */
+export async function audioUrlToAdtsStream(url, onBytes) {
+  const ff = await ffmpegBin();
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    ...FF_NET_ARGS, "-i", url,
+    "-vn", "-c:a", "aac", "-b:a", "128k",
+    "-f", "adts", "pipe:1"
+  ];
+  const proc = spawn(ff, args, { stdio: ["ignore", "pipe", "pipe"] });
+  proc.stderr.on("data", () => {});
+  const stream = withByteCounter(proc.stdout, onBytes);
+  const cleanup = () => { try { proc.kill("SIGKILL"); } catch {} };
+  return { stream, cleanup };
+}
+
+/** بث stdout من yt-dlp مباشرة (احتياط أخير — ما يزال بثاً صافياً بلا تخزين) */
+export async function ytdlpReadable(ytUrl, format, onBytes) {
   const bin  = await ytdlpBin();
-  const fm   = ffmpegPath();
+  const ff   = await ffmpegBin();
   const args = [ytUrl, "-f", format, "--output", "-",
     "--no-playlist", "--no-warnings", "-q", "--no-part",
-    "--ffmpeg-location", fm
+    "--ffmpeg-location", ff
   ];
   const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
-  proc.stderr.on("data", () => {}); // تجاهل stderr
-  return { stream: proc.stdout, process: proc };
+  proc.stderr.on("data", () => {});
+  const stream = withByteCounter(proc.stdout, onBytes);
+  const cleanup = () => { try { proc.kill("SIGKILL"); } catch {} };
+  return { stream, cleanup };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// streamFilm — تدفق فيلم (بدون حد للحجم)
+// حلّالات الجودة — تُرجع خطة إرسال جاهزة للمعالج
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @returns {{ buffer?, directUrl?, title, quality, ext }}
- *   directUrl: استخدم video:{url:directUrl} في sendMessage  (صفر RAM — الأفضل)
- *   buffer:    استخدم video:buffer في sendMessage (RAM — مسار أخير)
+ * يحلّ فيديو يوتيوب إلى خطة بث بحسب الجودة المطلوبة:
+ *   { title, seconds, thumb, directUrl?, makeStream? }
+ *
+ * - directUrl: رابط mp4 مدمج واحد — الأفضل: Baileys يبثه بنفسه (صفر موارد)
+ * - makeStream(): يبدأ بث ffmpeg/yt-dlp عند الطلب — يُستدعى فقط إن فشل الرابط
+ *
+ * الجودات:
+ *   1 → 360p  (الصيغة 18 المدمجة — رابط واحد مضمون)
+ *   2 → 720p  حقيقية (دمج DASH بالنسخ؛ يوتيوب أزال 22 المدمجة)
+ *   3 → 1080p حقيقية (دمج DASH بالنسخ)
  */
+async function resolveVideoPlan(video, quality, onProgress, qlLabel) {
+  const heightCap = quality === 1 ? 360 : quality === 2 ? 720 : 1080;
+  const plan = {
+    title: video.title,
+    seconds: Math.max(1, video.duration || 0),
+    thumb: null,
+    directUrl: null,
+    makeStream: null
+  };
+
+  // الصورة المصغرة بالتوازي (بضعة KB — لا تعطل شيئاً لو فشلت)
+  const thumbPromise = fetchThumb(video.videoId || video.url).catch(() => null);
+
+  if (quality === 1) {
+    // 360p: الصيغة 18 مدمجة h264+aac — رابط واحد يعمل مباشرة على واتساب
+    try {
+      const urls = await getDirectUrls(video.url, "18/b[height<=360][ext=mp4][vcodec^=avc]");
+      if (urls.length === 1) plan.directUrl = urls[0];
+      else if (urls.length === 2) {
+        plan.makeStream = (onBytes) => mergeUrlsToStream(urls[0], urls[1], onBytes);
+      }
+    } catch {}
+    if (!plan.directUrl && !plan.makeStream) {
+      plan.makeStream = (onBytes) => ytdlpReadable(video.url, "18/b[height<=360]", onBytes);
+    }
+  } else {
+    // 720p/1080p: جرّب مدمجاً واحداً أولاً (نادر لكنه أرخص)، ثم دمج DASH بالنسخ
+    let premergedUrl = null;
+    try {
+      const urls = await getDirectUrls(video.url, `b[height<=${heightCap}][ext=mp4][vcodec^=avc][acodec!=none]`);
+      if (urls.length === 1) premergedUrl = urls[0];
+    } catch {}
+
+    if (premergedUrl) {
+      plan.directUrl = premergedUrl;
+    } else {
+      // h264+aac حصراً حتى يكون الناتج المدموج نسخاً صافياً يفهمه واتساب
+      let pair = null;
+      try {
+        const urls = await getDirectUrls(
+          video.url,
+          `bv*[height<=${heightCap}][ext=mp4][vcodec^=avc]+ba[ext=m4a]`
+        );
+        if (urls.length === 2) pair = urls;
+        else if (urls.length === 1) plan.directUrl = urls[0];
+      } catch {}
+      if (pair) {
+        plan.makeStream = (onBytes) => mergeUrlsToStream(pair[0], pair[1], onBytes);
+      } else if (!plan.directUrl) {
+        // آخر احتياط: الجودة الأدنى المضمونة بدل الفشل الكامل
+        try {
+          const urls = await getDirectUrls(video.url, "18");
+          if (urls.length === 1) plan.directUrl = urls[0];
+        } catch {}
+        if (!plan.directUrl) plan.makeStream = (onBytes) => ytdlpReadable(video.url, "18", onBytes);
+      }
+    }
+  }
+
+  plan.thumb = await thumbPromise;
+  return plan;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// الواجهات العامة — فيديو / فيلم / صوت
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @returns {{ title, seconds, thumb, directUrl?, makeStream? }}
+ *   directUrl  → sendMessage({ video: { url: directUrl } })          — صفر موارد
+ *   makeStream → const {stream, cleanup} = await makeStream(onBytes)
+ *                sendMessage({ video: { stream } })                  — بث صافٍ
+ */
+export async function streamVideo(query, quality, onProgress, offset) {
+  quality = Math.min(3, Math.max(1, parseInt(quality) || 2));
+  offset  = Math.max(0, parseInt(offset) || 0);
+  const qlLabel = QUALITY_LABEL[quality];
+
+  if (onProgress) await onProgress("search", query, qlLabel, 0, 0, 0).catch(() => {});
+
+  const video = await youtubeSearch([query, query + " youtube", query + " فيديو"], 0, offset, offset + 5);
+  if (!video) throw new Error('لم أجد "' + query + '"');
+
+  if (onProgress) await onProgress("found", video.title, qlLabel, 0, 0, 0).catch(() => {});
+
+  const plan = await resolveVideoPlan(video, quality, onProgress, qlLabel);
+  plan.qlLabel = qlLabel;
+  return plan;
+}
+
 export async function streamFilm(query, quality, onProgress) {
   quality = Math.min(3, Math.max(1, parseInt(quality) || 2));
   const qlLabel = QUALITY_LABEL[quality];
@@ -461,87 +543,16 @@ export async function streamFilm(query, quality, onProgress) {
 
   if (onProgress) await onProgress("found", video.title, qlLabel, 0, 0, 0).catch(() => {});
 
-  const format = FORMATS.film[quality] || FORMATS.film[2];
-
-  // ── المسار 1: URL مباشر → واتساب يحمّل بنفسه (صفر RAM على السيرفر) ──────
-  try {
-    const directUrl = await getDirectUrl(video.url, format);
-    if (directUrl) {
-      if (onProgress) await onProgress("url_send", video.title, qlLabel, 0, 0, 0).catch(() => {});
-      return { directUrl, title: video.title, quality, ext: "mp4" };
-    }
-  } catch {}
-
-  // ── المسار 2: HTTP GET streaming → Buffer (بافر في RAM) ──────────────────
-  if (onProgress) await onProgress("streaming", video.title, qlLabel, 0, 0, 0).catch(() => {});
-  try {
-    const directUrl2 = await getDirectUrl(video.url, "18"); // fallback 360p
-    const buffer = await streamUrlToBuffer(directUrl2, BUFFER_MAX_MB, (recv, tot, pct) =>
-      onProgress ? onProgress("progress", video.title, qlLabel, recv, tot, pct) : Promise.resolve()
-    );
-    return { buffer, title: video.title, quality, ext: "mp4" };
-  } catch {}
-
-  // ── المسار 3: yt-dlp stdout pipe → Buffer ────────────────────────────────
-  if (onProgress) await onProgress("piping", video.title, qlLabel, 0, 0, 0).catch(() => {});
-  const buffer = await ytdlpPipeToBuffer(video.url, format, BUFFER_MAX_MB, (recv, tot, pct) =>
-    onProgress ? onProgress("progress", video.title, qlLabel, recv, tot, pct) : Promise.resolve()
-  );
-  return { buffer, title: video.title, quality, ext: "mp4" };
+  const plan = await resolveVideoPlan(video, quality, onProgress, qlLabel);
+  plan.qlLabel = qlLabel;
+  return plan;
 }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// streamVideo — تدفق فيديو يوتيوب (مع offset للعدد الصحيح)
-// ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @param {number} offset — رقم الفيديو في قائمة البحث (0=الأول, 1=الثاني, ...)
+ * @returns {{ title, seconds, directUrl?, mimetype, makeStream? }}
+ *   directUrl  → sendMessage({ audio: { url }, mimetype: 'audio/mp4' })
+ *   makeStream → sendMessage({ audio: { stream }, mimetype: 'audio/aac' })
  */
-export async function streamVideo(query, quality, onProgress, offset) {
-  quality = Math.min(3, Math.max(1, parseInt(quality) || 2));
-  offset  = Math.max(0, parseInt(offset) || 0);
-  const qlLabel = QUALITY_LABEL[quality];
-
-  if (onProgress) await onProgress("search", query, qlLabel, 0, 0, 0).catch(() => {});
-
-  const video = await youtubeSearch([query, query + " youtube", query + " فيديو"], 0, offset, offset + 5);
-  if (!video) throw new Error('لم أجد "' + query + '"');
-
-  if (onProgress) await onProgress("found", video.title, qlLabel, 0, 0, 0).catch(() => {});
-
-  const format = FORMATS.vid[quality] || FORMATS.vid[2];
-
-  // ── المسار 1: URL مباشر → صفر RAM ────────────────────────────────────────
-  try {
-    const directUrl = await getDirectUrl(video.url, format);
-    if (directUrl) {
-      if (onProgress) await onProgress("url_send", video.title, qlLabel, 0, 0, 0).catch(() => {});
-      return { directUrl, title: video.title, quality, ext: "mp4" };
-    }
-  } catch {}
-
-  // ── المسار 2: HTTP GET streaming → Buffer ────────────────────────────────
-  if (onProgress) await onProgress("streaming", video.title, qlLabel, 0, 0, 0).catch(() => {});
-  try {
-    const directUrl2 = await getDirectUrl(video.url, "18");
-    const buffer = await streamUrlToBuffer(directUrl2, BUFFER_MAX_MB, (recv, tot, pct) =>
-      onProgress ? onProgress("progress", video.title, qlLabel, recv, tot, pct) : Promise.resolve()
-    );
-    return { buffer, title: video.title, quality, ext: "mp4" };
-  } catch {}
-
-  // ── المسار 3: yt-dlp pipe → Buffer ───────────────────────────────────────
-  if (onProgress) await onProgress("piping", video.title, qlLabel, 0, 0, 0).catch(() => {});
-  const buffer = await ytdlpPipeToBuffer(video.url, format, BUFFER_MAX_MB, (recv, tot, pct) =>
-    onProgress ? onProgress("progress", video.title, qlLabel, recv, tot, pct) : Promise.resolve()
-  );
-  return { buffer, title: video.title, quality, ext: "mp4" };
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// streamSong — تدفق صوت
-// ══════════════════════════════════════════════════════════════════════════════
-
 export async function streamSong(query, onProgress, offset) {
   offset = Math.max(0, parseInt(offset) || 0);
   if (onProgress) await onProgress("search", query, "صوت", 0, 0, 0).catch(() => {});
@@ -551,36 +562,36 @@ export async function streamSong(query, onProgress, offset) {
 
   if (onProgress) await onProgress("found", video.title, "صوت", 0, 0, 0).catch(() => {});
 
-  // [FIX-AUDIO] استخدام صيغة m4a دائماً (140 هو AAC 128kbps — متوفر على كل يوتيوب)
+  const plan = {
+    title: video.title,
+    seconds: Math.max(1, video.duration || 0),
+    directUrl: null,
+    mimetype: "audio/mp4",
+    makeStream: null
+  };
+
+  // m4a (الصيغة 140 = AAC) متوفرة على كل يوتيوب تقريباً — رابط واحد مباشر
   try {
-    const directUrl = await getDirectUrl(video.url, FORMATS.song);
-    if (directUrl) {
-      if (onProgress) await onProgress("url_send", video.title, "صوت", 0, 0, 0).catch(() => {});
-      const buffer = await streamUrlToBuffer(directUrl, 100, (recv, tot, pct) =>
-        onProgress ? onProgress("progress", video.title, "صوت", recv, tot, pct) : Promise.resolve()
-      );
-      // [FIX-AUDIO] كشف الصيغة الفعلية من بايتات الملف
-      const ext = detectAudioExt(buffer);
-      // إذا كانت webm/opus، نحاول التحميل مرة ثانية بصيغة بديلة
-      if (ext === "ogg") {
-        try {
-          const fallbackUrl = await getDirectUrl(video.url, "bestaudio[ext=mp3]/bestaudio[ext=m4a]");
-          if (fallbackUrl) {
-            const buf2 = await streamUrlToBuffer(fallbackUrl, 100, null);
-            const ext2 = detectAudioExt(buf2);
-            if (ext2 !== "ogg") return { buffer: buf2, title: video.title, ext: ext2 };
-          }
-        } catch {}
-      }
-      return { buffer, title: video.title, ext };
+    const urls = await getDirectUrls(video.url, "140/139/ba[ext=m4a]");
+    if (urls.length >= 1) {
+      plan.directUrl = urls[0];
+      return plan;
     }
   } catch {}
 
-  if (onProgress) await onProgress("piping", video.title, "صوت", 0, 0, 0).catch(() => {});
-  const buffer = await ytdlpPipeToBuffer(video.url, FORMATS.song, 100, (recv, tot, pct) =>
-    onProgress ? onProgress("progress", video.title, "صوت", recv, tot, pct) : Promise.resolve()
-  );
-  // [FIX-AUDIO] كشف الصيغة الفعلية
-  const ext = detectAudioExt(buffer);
-  return { buffer, title: video.title, ext };
+  // احتياط: أفضل صوت متاح (غالباً opus) → تحويل بث إلى AAC-ADTS يفهمه واتساب
+  try {
+    const urls = await getDirectUrls(video.url, "ba");
+    if (urls.length >= 1) {
+      const src = urls[0];
+      plan.mimetype = "audio/aac";
+      plan.makeStream = (onBytes) => audioUrlToAdtsStream(src, onBytes);
+      return plan;
+    }
+  } catch {}
+
+  // احتياط أخير: بث yt-dlp نفسه
+  plan.mimetype = "audio/mp4";
+  plan.makeStream = (onBytes) => ytdlpReadable(video.url, "140/139/ba[ext=m4a]/ba", onBytes);
+  return plan;
 }

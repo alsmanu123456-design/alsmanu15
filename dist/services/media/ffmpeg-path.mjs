@@ -1,32 +1,35 @@
 // dist/services/media/ffmpeg-path.mjs
 // ────────────────────────────────────────────────────────────────
-// يحلّ مسار ثنائيات ffmpeg / ffprobe بشكل يعمل على أي استضافة دون
-// الاعتماد على تثبيتها يدوياً في النظام:
-//   1. الحزم المرفقة ffmpeg-static / ffprobe-static (ثنائيات جاهزة لكل منصة)
-//   2. متغيرات البيئة FFMPEG_PATH / FFPROBE_PATH (إن ضبطها المشغّل)
-//   3. الاسم المجرّد "ffmpeg"/"ffprobe" من PATH (احتياط أخير)
+// يحلّ مسار ثنائي ffmpeg بشكل يعمل على أي استضافة، مع تفضيل النسخة
+// المثبتة في النظام لتوفير مساحة القرص (بعض الاستضافات تعطي 1GB فقط):
+//   1. متغير البيئة FFMPEG_PATH (إن ضبطه المشغّل)
+//   2. ffmpeg الموجود في PATH بالنظام (لا يستهلك مساحة إضافية)
+//   3. حزمة ffmpeg-static المرفقة (احتياط لمنصة واحدة، ~80MB)
 //
-// النتيجة تُخزَّن (cache) بعد أول حساب لتفادي إعادة الاستيراد لكل استدعاء.
+// ملاحظة: أُزيلت ffprobe-static تماماً (كانت 351MB وتملأ القرص) —
+// نستخرج مدة الصوت من ffmpeg نفسه في audio-chunker.mjs.
+//
+// النتيجة تُخزَّن (cache) بعد أول حساب لتفادي إعادة الفحص لكل استدعاء.
 
 import { existsSync } from "fs";
+import { execFileSync } from "child_process";
 
 let _ffmpegCached = null;
-let _ffprobeCached = null;
+
+function _systemHasFfmpeg() {
+  try {
+    // "command -v" لا يحمّل الثنائي كاملاً، مجرد فحص وجوده في PATH
+    execFileSync("ffmpeg", ["-version"], { stdio: "ignore", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function _tryImportDefault(mod) {
   try {
     const m = await import(mod);
     const p = m?.default || m;
-    return typeof p === "string" ? p : null;
-  } catch {
-    return null;
-  }
-}
-
-async function _tryImportProp(mod, prop) {
-  try {
-    const m = await import(mod);
-    const p = m?.[prop] || m?.default?.[prop];
     return typeof p === "string" ? p : null;
   } catch {
     return null;
@@ -46,39 +49,20 @@ export async function getFfmpegPath() {
     return _ffmpegCached;
   }
 
-  // 2. حزمة ffmpeg-static المرفقة
+  // 2. ffmpeg مثبّت في النظام — الأفضل لأنه لا يستهلك مساحة إضافية
+  if (_systemHasFfmpeg()) {
+    _ffmpegCached = "ffmpeg";
+    return _ffmpegCached;
+  }
+
+  // 3. حزمة ffmpeg-static المرفقة (احتياط)
   const staticPath = await _tryImportDefault("ffmpeg-static");
   if (staticPath && existsSync(staticPath)) {
     _ffmpegCached = staticPath;
     return _ffmpegCached;
   }
 
-  // 3. احتياط: الاسم المجرّد من PATH
+  // 4. احتياط أخير: الاسم المجرّد من PATH
   _ffmpegCached = "ffmpeg";
   return _ffmpegCached;
-}
-
-/**
- * يُعيد مسار ffprobe القابل للتنفيذ.
- * @returns {Promise<string>}
- */
-export async function getFfprobePath() {
-  if (_ffprobeCached) return _ffprobeCached;
-
-  // 1. متغير بيئة صريح
-  if (process.env.FFPROBE_PATH && existsSync(process.env.FFPROBE_PATH)) {
-    _ffprobeCached = process.env.FFPROBE_PATH;
-    return _ffprobeCached;
-  }
-
-  // 2. حزمة ffprobe-static المرفقة (تصدّر { path })
-  const staticPath = await _tryImportProp("ffprobe-static", "path");
-  if (staticPath && existsSync(staticPath)) {
-    _ffprobeCached = staticPath;
-    return _ffprobeCached;
-  }
-
-  // 3. احتياط: الاسم المجرّد من PATH
-  _ffprobeCached = "ffprobe";
-  return _ffprobeCached;
 }

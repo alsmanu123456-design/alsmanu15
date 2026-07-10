@@ -22,10 +22,10 @@ const CRITICAL_PACKAGES = [
   "yt-search",
   "node-telegram-bot-api",
   "sharp",
-  // ثنائيات ffmpeg/ffprobe مرفقة كحزم npm — تضمن عمل ميزتَي تحويل
-  // النص↔الصوت (تقسيم/دمج المقاطع) على أي استضافة دون تثبيت يدوي.
+  // ffmpeg مرفق كحزمة احتياطية خفيفة (منصة واحدة، ~80MB) — يُستخدم فقط
+  // إن لم يكن ffmpeg مثبتاً في النظام. أُزيلت ffprobe-static (351MB كانت
+  // تملأ القرص وتوقف البوت) ونستخرج مدة الصوت من ffmpeg نفسه.
   "ffmpeg-static",
-  "ffprobe-static",
 ];
 
 // ── تثبيت node_modules إذا غائبة ────────────────────────────

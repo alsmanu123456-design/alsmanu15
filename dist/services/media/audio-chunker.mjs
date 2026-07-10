@@ -14,7 +14,7 @@ import os from "os";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
-import { getFfmpegPath, getFfprobePath } from "./ffmpeg-path.mjs";
+import { getFfmpegPath } from "./ffmpeg-path.mjs";
 
 const MAX_CHUNK_SECONDS = 280; // هامش أمان تحت حد الـ5 دقائق (300 ثانية)
 
@@ -36,19 +36,16 @@ async function runFfmpeg(args) {
   });
 }
 
-async function runFfprobe(args) {
-  const bin = await getFfprobePath(); // يعمل على أي استضافة عبر ffprobe-static
+// يشغّل ffmpeg ويعيد كامل stderr بغض النظر عن كود الخروج — يُستخدم لاستخراج
+// معلومات الوسائط (مثل المدة) بدون الحاجة إلى ffprobe منفصل.
+async function runFfmpegCaptureStderr(args) {
+  const bin = await getFfmpegPath();
   return new Promise((resolve, reject) => {
-    const fp = spawn(bin, args);
-    let stdout = "";
+    const ff = spawn(bin, args);
     let stderr = "";
-    fp.stdout.on("data", (d) => { stdout += d.toString(); });
-    fp.stderr.on("data", (d) => { stderr += d.toString(); });
-    fp.on("error", reject);
-    fp.on("close", (code) => {
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(`ffprobe exited with code ${code}: ${stderr.slice(-500)}`));
-    });
+    ff.stderr.on("data", (d) => { stderr += d.toString(); });
+    ff.on("error", reject);
+    ff.on("close", () => resolve(stderr));
   });
 }
 
@@ -93,14 +90,14 @@ export async function getDurationSeconds(buffer, ext = "ogg") {
   const p = tmpFile(ext);
   await fs.writeFile(p, buffer);
   try {
-    const out = await runFfprobe([
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      p,
-    ]);
-    const n = parseFloat(out);
-    return Number.isFinite(n) ? n : null;
+    // نستخرج المدة من ffmpeg نفسه (سطر "Duration: HH:MM:SS.xx" في stderr)
+    // بدلاً من ffprobe — هذا يلغي الحاجة لحزمة ffprobe-static الضخمة (351MB)
+    // التي كانت تملأ القرص عند التثبيت.
+    const stderr = await runFfmpegCaptureStderr(["-i", p]);
+    const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    const secs = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+    return Number.isFinite(secs) ? secs : null;
   } catch {
     return null;
   } finally {

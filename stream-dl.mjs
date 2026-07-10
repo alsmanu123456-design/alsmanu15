@@ -98,8 +98,11 @@ export function buildProgressMsg(title, stage, qlLabel, recv, total, pct) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function ytdlpBin() {
-  const local = join(__dirname, "bin", "yt-dlp");
-  if (existsSync(local)) return local;
+  // كل الأسماء المحتملة محلياً (yt-dlp الثنائي أو yt-dlp-py الـ zipapp)
+  for (const name of ["yt-dlp", "yt-dlp-py"]) {
+    const local = join(__dirname, "bin", name);
+    if (existsSync(local)) return local;
+  }
   if (process.env.YTDLP_PATH && existsSync(process.env.YTDLP_PATH)) return process.env.YTDLP_PATH;
   try {
     const { stdout } = await execFileP("which", ["yt-dlp"], { timeout: 3000 });
@@ -260,14 +263,44 @@ export async function youtubeSearchMultiple(query, count, minDurSec) {
 // استخراج الروابط المباشرة من CDN يوتيوب (بدون أي تنزيل)
 // ══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * وسائط إضافية مشتركة لـ yt-dlp:
+ *  - cookies.txt في جذر المشروع (إن وُجد) يتجاوز حظر "confirm you're not a bot"
+ *  - YTDLP_EXTRA_ARGS من البيئة لمرونة الاستضافات المختلفة
+ */
+function ytdlpCommonArgs() {
+  const extra = [];
+  const cookiesFile = join(__dirname, "cookies.txt");
+  if (existsSync(cookiesFile)) extra.push("--cookies", cookiesFile);
+  if (process.env.YTDLP_EXTRA_ARGS) {
+    try { extra.push(...process.env.YTDLP_EXTRA_ARGS.split(" ").filter(Boolean)); } catch {}
+  }
+  return extra;
+}
+
+// عملاء يوتيوب بالترتيب — بعض الاستضافات يُحظر عليها العميل الافتراضي
+const YT_CLIENTS = [null, "tv", "android", "web_safari"];
+
 /** يُرجع كل الروابط التي يطبعها yt-dlp (1 = مدمج، 2 = فيديو + صوت منفصلان) */
 export async function getDirectUrls(ytUrl, format) {
-  const bin  = await ytdlpBin();
-  const args = [ytUrl, "-f", format, "--get-url", "--no-playlist", "--no-warnings", "-q"];
-  const { stdout } = await execFileP(bin, args, { timeout: 40000 });
-  const urls = stdout.trim().split("\n").filter(u => u.startsWith("http"));
-  if (!urls.length) throw new Error("لم يُعثر على رابط مباشر");
-  return urls;
+  const bin    = await ytdlpBin();
+  const common = ytdlpCommonArgs();
+  let lastErr  = null;
+  for (const client of YT_CLIENTS) {
+    const args = [ytUrl, "-f", format, "--get-url", "--no-playlist", "--no-warnings", "-q", ...common];
+    if (client) args.push("--extractor-args", "youtube:player_client=" + client);
+    try {
+      const { stdout } = await execFileP(bin, args, { timeout: 40000 });
+      const urls = stdout.trim().split("\n").filter(u => u.startsWith("http"));
+      if (urls.length) return urls;
+    } catch (e) {
+      lastErr = e;
+      // خطأ الصيغة غير المتاحة لن يتغير بتبديل العميل — لا داعي للإعادة
+      const msg = String(e?.stderr || e?.message || "");
+      if (msg.includes("Requested format is not available")) break;
+    }
+  }
+  throw new Error("لم يُعثر على رابط مباشر" + (lastErr ? ": " + String(lastErr.stderr || lastErr.message || "").slice(0, 120) : ""));
 }
 
 /**
@@ -410,12 +443,17 @@ export async function ytdlpReadable(ytUrl, format, onBytes) {
   const ff   = await ffmpegBin();
   const args = [ytUrl, "-f", format, "--output", "-",
     "--no-playlist", "--no-warnings", "-q", "--no-part",
-    "--ffmpeg-location", ff
+    "--ffmpeg-location", ff,
+    ...ytdlpCommonArgs()
   ];
   const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
-  proc.stderr.on("data", () => {});
+  let errTail = "";
+  proc.stderr.on("data", (d) => { errTail = (errTail + d.toString()).slice(-300); });
   const stream = withByteCounter(proc.stdout, onBytes);
   const cleanup = () => { try { proc.kill("SIGKILL"); } catch {} };
+  proc.on("close", (code) => {
+    if (code !== 0 && code !== null) stream.destroy(new Error("yt-dlp بث فشل: " + errTail.slice(-150)));
+  });
   return { stream, cleanup };
 }
 

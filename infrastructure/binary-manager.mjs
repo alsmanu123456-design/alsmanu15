@@ -23,6 +23,48 @@ import { getPlatformBinary }  from "../utils/platform.mjs";
 
 const execFileAsync = promisify(execFile);
 
+// ── ffmpeg-static ────────────────────────────────────────────
+
+/**
+ * يتأكد أن ثنائي ffmpeg-static مُنزَّل فعلاً.
+ * مدراء الحزم (خصوصاً pnpm) يتخطون سكربت postinstall الذي ينزّل الثنائي،
+ * فتبقى الحزمة "مثبتة" لكن بلا ffmpeg حقيقي — ما يكسر دمج الفيديو
+ * وتحويل الصوت. لا يفعل شيئاً إن كان ffmpeg موجوداً في النظام (يوفر ~80MB).
+ * @param {string} baseDir — جذر المشروع
+ */
+export async function ensureFfmpegStatic(baseDir) {
+  // ffmpeg النظام موجود؟ لا حاجة للثنائي المرفق
+  try {
+    execSync("ffmpeg -version", { stdio: "ignore", timeout: 5_000 });
+    ok("ffmpeg: موجود في النظام");
+    return { ok: true, source: "system" };
+  } catch {}
+  try {
+    const { createRequire } = await import("module");
+    const req = createRequire(join(baseDir, "package.json"));
+    let binPath = null;
+    try { binPath = req("ffmpeg-static"); } catch {}
+    if (binPath && existsSync(binPath)) {
+      ok("ffmpeg-static: الثنائي جاهز");
+      return { ok: true, source: "static" };
+    }
+    if (binPath) {
+      // الحزمة موجودة لكن الثنائي غائب → شغّل سكربت التنزيل الخاص بها
+      const { dirname } = await import("path");
+      const pkgDir = dirname(req.resolve("ffmpeg-static/package.json"));
+      wrn("ffmpeg-static: الثنائي غائب — جارٍ تنزيله...");
+      execSync("node install.js", { cwd: pkgDir, stdio: "ignore", timeout: 300_000 });
+      if (existsSync(binPath)) {
+        ok("ffmpeg-static: تم تنزيل الثنائي ✔");
+        return { ok: true, source: "static-downloaded" };
+      }
+    }
+  } catch (e) {
+    wrn("ffmpeg-static: فشل التنزيل — " + String(e?.message || e).slice(0, 80));
+  }
+  return { ok: false };
+}
+
 // ── yt-dlp ───────────────────────────────────────────────────
 
 /**

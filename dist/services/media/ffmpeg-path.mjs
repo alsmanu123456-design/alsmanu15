@@ -13,6 +13,7 @@
 
 import { existsSync } from "fs";
 import { execFileSync } from "child_process";
+import { createRequire } from "module";
 
 let _ffmpegCached = null;
 
@@ -26,11 +27,14 @@ function _systemHasFfmpeg() {
   }
 }
 
-async function _tryImportDefault(mod) {
+// createRequire أوثق من import() الديناميكي لحزم CJS التي تصدّر نصاً
+// (ffmpeg-static يصدّر module.exports = "/path") — import() كان يفشل معها.
+const _require = createRequire(import.meta.url);
+
+function _tryRequirePath(mod) {
   try {
-    const m = await import(mod);
-    const p = m?.default || m;
-    return typeof p === "string" ? p : null;
+    const p = _require(mod);
+    return typeof p === "string" ? p : (typeof p?.default === "string" ? p.default : null);
   } catch {
     return null;
   }
@@ -56,7 +60,7 @@ export async function getFfmpegPath() {
   }
 
   // 3. حزمة ffmpeg-static المرفقة (احتياط)
-  const staticPath = await _tryImportDefault("ffmpeg-static");
+  const staticPath = _tryRequirePath("ffmpeg-static");
   if (staticPath && existsSync(staticPath)) {
     _ffmpegCached = staticPath;
     return _ffmpegCached;

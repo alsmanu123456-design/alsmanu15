@@ -24,7 +24,7 @@ import { runAllChecks }    from "../core/health.mjs";
 import { loadConfig, applyDefaults } from "../core/config.mjs";
 import { runAll as runPatches }      from "../infrastructure/patch-manager.mjs";
 import { ensure as ensurePackages }  from "../infrastructure/package-manager.mjs";
-import { ensureYtDlp }               from "../infrastructure/binary-manager.mjs";
+import { ensureYtDlp, ensureFfmpegStatic } from "../infrastructure/binary-manager.mjs";
 import { spawnBot }                  from "../infrastructure/process-manager.mjs";
 import { startEngine }               from "../engine/index.mjs";
 
@@ -49,6 +49,7 @@ await ensurePackages(BASE_DIR);
 
 // ─── 5. External Binaries ────────────────────────────────────────
 await ensureYtDlp(BASE_DIR);
+await ensureFfmpegStatic(BASE_DIR); // ينزّل ثنائي ffmpeg إن تخطاه مدير الحزم
 
 // ─── 6. Launch Bot ───────────────────────────────────────────────
 const port = parseInt(process.env.PORT ?? "5000");

@@ -281,8 +281,16 @@ function ytdlpCommonArgs() {
 // عملاء يوتيوب بالترتيب — بعض الاستضافات يُحظر عليها العميل الافتراضي
 const YT_CLIENTS = [null, "tv", "android", "web_safari"];
 
+// ذاكرة حظر IP: عند رصد "Sign in to confirm you're not a bot" نتوقف عن
+// محاولات yt-dlp لمدة 10 دقائق ونقفز مباشرة لوسطاء الإنقاذ — بدل إهدار
+// دقائق لكل طلب في محاولات محكومة بالفشل.
+let _ytBlockedUntil = 0;
+function ytBlocked() { return Date.now() < _ytBlockedUntil; }
+function markYtBlocked() { _ytBlockedUntil = Date.now() + 10 * 60 * 1000; }
+
 /** يُرجع كل الروابط التي يطبعها yt-dlp (1 = مدمج، 2 = فيديو + صوت منفصلان) */
 export async function getDirectUrls(ytUrl, format) {
+  if (ytBlocked()) throw new Error("yt-dlp محظور مؤقتاً (IP) — استخدم وسيط الإنقاذ");
   const bin    = await ytdlpBin();
   const common = ytdlpCommonArgs();
   let lastErr  = null;
@@ -295,9 +303,11 @@ export async function getDirectUrls(ytUrl, format) {
       if (urls.length) return urls;
     } catch (e) {
       lastErr = e;
-      // خطأ الصيغة غير المتاحة لن يتغير بتبديل العميل — لا داعي للإعادة
       const msg = String(e?.stderr || e?.message || "");
+      // خطأ الصيغة غير المتاحة لن يتغير بتبديل العميل — لا داعي للإعادة
       if (msg.includes("Requested format is not available")) break;
+      // حظر IP: كل العملاء سيفشلون بنفس السبب — سجّل وتوقف فوراً
+      if (msg.includes("Sign in to confirm") || msg.includes("not a bot")) { markYtBlocked(); break; }
     }
   }
   throw new Error("لم يُعثر على رابط مباشر" + (lastErr ? ": " + String(lastErr.stderr || lastErr.message || "").slice(0, 120) : ""));
@@ -316,6 +326,50 @@ export async function getDirectUrl(ytUrl, format) {
 // ══════════════════════════════════════════════════════════════════════════════
 // الصورة المصغرة من CDN يوتيوب (بضعة KB — تمنع Baileys من حفظ نسخة أصلية للقرص)
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// طبقة الإنقاذ: وسطاء Piped — يجلبون نفس فيديو يوتيوب لكن عبر خادم وسيط
+// بـ IP غير محظور. تُستخدم فقط عندما يحظر يوتيوب IP الاستضافة نفسها
+// ("Sign in to confirm you're not a bot"). المصدر يبقى يوتيوب دون تغيير.
+// قابلة للتوسيع من البيئة: PIPED_INSTANCES="https://x.com,https://y.com"
+// ══════════════════════════════════════════════════════════════════════════════
+const PIPED_INSTANCES = (process.env.PIPED_INSTANCES || "")
+  .split(",").map(s => s.trim()).filter(Boolean)
+  .concat([
+    "https://api.piped.private.coffee",
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.reallyaweso.me",
+    "https://pipedapi.ducks.party",
+  ]);
+
+/** يجلب روابط البث من أول وسيط Piped يستجيب. يرمي خطأ إن فشل الجميع. */
+export async function pipedStreams(videoId) {
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 15000);
+      const res = await fetch(base + "/streams/" + videoId, { signal: ctl.signal });
+      clearTimeout(t);
+      if (!res.ok) continue;
+      const d = await res.json();
+      // مدمج h264+aac (itag 18) — يُرسل لواتساب كما هو
+      const prog  = (d.videoStreams || []).find(s => s.mimeType === "video/mp4" && !s.videoOnly && s.url);
+      // صوت m4a منفصل + فيديو-فقط mp4 (للدمج بالنسخ إن توفرا)
+      const audio = (d.audioStreams || []).find(s => s.mimeType === "audio/mp4" && s.url) || null;
+      const vOnly = (d.videoStreams || []).filter(s => s.mimeType === "video/mp4" && s.videoOnly && s.url)
+        .map(s => ({ url: s.url, height: parseInt(s.quality) || 0 }));
+      if (!prog && !audio && !vOnly.length) continue;
+      return {
+        prog: prog ? prog.url : null,
+        audio: audio ? audio.url : null,
+        videoOnly: vOnly,
+        duration: d.duration || 0,
+        title: d.title || ""
+      };
+    } catch {}
+  }
+  throw new Error("يوتيوب حظر IP الخادم وكل وسطاء الإنقاذ غير متاحين حالياً");
+}
 
 function extractVideoId(ytUrl) {
   const m = String(ytUrl || "").match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
@@ -496,6 +550,17 @@ async function resolveVideoPlan(video, quality, onProgress, qlLabel) {
       }
     } catch {}
     if (!plan.directUrl && !plan.makeStream) {
+      // إنقاذ Piped: نفس الفيديو عبر وسيط بـ IP غير محظور
+      try {
+        const ps = await pipedStreams(video.videoId || extractVideoId(video.url));
+        if (ps.prog) plan.directUrl = ps.prog;
+        else if (ps.videoOnly.length && ps.audio) {
+          const bestV = ps.videoOnly.filter(v => v.height <= 360).sort((a, b) => b.height - a.height)[0] || ps.videoOnly[0];
+          plan.makeStream = (onBytes) => mergeUrlsToStream(bestV.url, ps.audio, onBytes);
+        }
+      } catch {}
+    }
+    if (!plan.directUrl && !plan.makeStream) {
       plan.makeStream = (onBytes) => ytdlpReadable(video.url, "18/b[height<=360]", onBytes);
     }
   } else {
@@ -527,7 +592,21 @@ async function resolveVideoPlan(video, quality, onProgress, qlLabel) {
           const urls = await getDirectUrls(video.url, "18");
           if (urls.length === 1) plan.directUrl = urls[0];
         } catch {}
-        if (!plan.directUrl) plan.makeStream = (onBytes) => ytdlpReadable(video.url, "18", onBytes);
+        if (!plan.directUrl) {
+          // إنقاذ Piped: أعلى جودة متاحة عبر الوسيط (دمج إن وُجد فيديو+صوت منفصلان)
+          try {
+            const ps = await pipedStreams(video.videoId || extractVideoId(video.url));
+            const bestV = ps.videoOnly.filter(v => v.height <= heightCap).sort((a, b) => b.height - a.height)[0];
+            if (bestV && ps.audio) {
+              plan.makeStream = (onBytes) => mergeUrlsToStream(bestV.url, ps.audio, onBytes);
+            } else if (ps.prog) {
+              plan.directUrl = ps.prog;
+            }
+          } catch {}
+        }
+        if (!plan.directUrl && !plan.makeStream) {
+          plan.makeStream = (onBytes) => ytdlpReadable(video.url, "18", onBytes);
+        }
       }
     }
   }
@@ -622,6 +701,23 @@ export async function streamSong(query, onProgress, offset) {
     const urls = await getDirectUrls(video.url, "ba");
     if (urls.length >= 1) {
       const src = urls[0];
+      plan.mimetype = "audio/aac";
+      plan.makeStream = (onBytes) => audioUrlToAdtsStream(src, onBytes);
+      return plan;
+    }
+  } catch {}
+
+  // إنقاذ Piped: صوت m4a مباشر إن وُجد، وإلا استخلاص AAC من المدمج 360p
+  // (نسخ بدون إعادة ترميز عندما يكون صوت المصدر AAC أصلاً)
+  try {
+    const ps = await pipedStreams(video.videoId || extractVideoId(video.url));
+    if (ps.audio) {
+      plan.directUrl = ps.audio;
+      plan.mimetype = "audio/mp4";
+      return plan;
+    }
+    if (ps.prog) {
+      const src = ps.prog;
       plan.mimetype = "audio/aac";
       plan.makeStream = (onBytes) => audioUrlToAdtsStream(src, onBytes);
       return plan;

@@ -130,12 +130,11 @@ private fun BrowserPanel(panel: Panel, viewModel: MainViewModel) {
     var confirmDelete by remember { mutableStateOf(false) }
 
     LaunchedEffect(panel.id) { session.loadUri(panel.url) }
-    BackHandler(enabled = session.canGoBack) { session.goBack() }
 
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { if (session.canGoBack) session.goBack() }, modifier = Modifier.size(40.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع") }
-            IconButton(onClick = { if (session.canGoForward) session.goForward() }, modifier = Modifier.size(40.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "تقدم") }
+            IconButton(onClick = session::goBack, modifier = Modifier.size(40.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع") }
+            IconButton(onClick = session::goForward, modifier = Modifier.size(40.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "تقدم") }
             TextField(
                 value = address,
                 onValueChange = { address = it },

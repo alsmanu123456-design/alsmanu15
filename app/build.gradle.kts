@@ -66,7 +66,7 @@ dependencies {
     implementation("io.ktor:ktor-client-okhttp:3.3.3")
     implementation("io.ktor:ktor-client-content-negotiation:3.3.3")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.3.3")
-    implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
+    implementation("org.mozilla.geckoview:geckoview-arm64-v8a:152.0.20260713164047")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")

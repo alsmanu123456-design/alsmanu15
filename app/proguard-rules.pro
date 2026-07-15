@@ -1,0 +1,4 @@
+-keep class org.mozilla.geckoview.** { *; }
+-dontwarn org.mozilla.geckoview.**
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-keep class kotlinx.serialization.** { *; }

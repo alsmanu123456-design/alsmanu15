@@ -13,3 +13,13 @@ __v0_jsx-dev-runtime.ts
 node_modules
 .next/
 .DS_Store
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+*.iml
+*.jks
+*.keystore
+keystore.properties
+app/release/

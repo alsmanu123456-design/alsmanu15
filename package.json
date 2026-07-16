@@ -6,5 +6,8 @@
     "dev": "python3 -m http.server 3000 --directory download",
     "build": "mkdir -p dist && cp -R download/. dist/",
     "start": "python3 -m http.server 3000 --directory dist"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.6.1"
   }
 }

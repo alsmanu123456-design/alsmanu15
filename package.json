@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "python3 -m http.server 3000 --directory download",
-    "start": "python3 -m http.server 3000 --directory download"
+    "build": "mkdir -p dist && cp -R download/. dist/",
+    "start": "python3 -m http.server 3000 --directory dist"
   }
 }
